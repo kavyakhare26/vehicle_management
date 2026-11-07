@@ -1,0 +1,1055 @@
+"""Database management and helper functions for Vehicle Management System.
+
+Handles MySQL connection pooling, parameterized execution, transaction safety,
+schema initialization, and CRUD operations for users, vehicles, customers, sales, and services.
+"""
+
+import os
+import re
+from datetime import datetime
+from decimal import Decimal
+import bcrypt
+import mysql.connector
+from mysql.connector import Error, errorcode
+import pandas as pd
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+
+def get_db_setting(key, default=""):
+    """Retrieve setting from st.secrets first, then fall back to .env / os.environ.
+    
+    Supports flat st.secrets keys (e.g. st.secrets["DB_HOST"]) as well as
+    nested sections (e.g. st.secrets["connections"]["mysql"] or st.secrets["mysql"]).
+    """
+    # 1. Try reading from Streamlit Secrets
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and st.secrets is not None:
+            # Direct flat key
+            if key in st.secrets:
+                return st.secrets[key]
+            
+            # Case-insensitive direct key
+            for sec_k, sec_v in st.secrets.items():
+                if sec_k.lower() == key.lower():
+                    return sec_v
+            
+            # Nested: [connections.mysql]
+            if "connections" in st.secrets and "mysql" in st.secrets["connections"]:
+                mysql_sec = st.secrets["connections"]["mysql"]
+                if key in mysql_sec:
+                    return mysql_sec[key]
+                if key.lower() in mysql_sec:
+                    return mysql_sec[key.lower()]
+                alias_map = {
+                    "DB_HOST": "host",
+                    "DB_PORT": "port",
+                    "DB_USER": "username",
+                    "DB_PASSWORD": "password",
+                    "DB_NAME": "database",
+                }
+                alias = alias_map.get(key)
+                if alias and alias in mysql_sec:
+                    return mysql_sec[alias]
+
+            # Nested: [mysql]
+            if "mysql" in st.secrets:
+                mysql_sec = st.secrets["mysql"]
+                if key in mysql_sec:
+                    return mysql_sec[key]
+                if key.lower() in mysql_sec:
+                    return mysql_sec[key.lower()]
+                alias_map = {
+                    "DB_HOST": "host",
+                    "DB_PORT": "port",
+                    "DB_USER": "username",
+                    "DB_PASSWORD": "password",
+                    "DB_NAME": "database",
+                }
+                alias = alias_map.get(key)
+                if alias and alias in mysql_sec:
+                    return mysql_sec[alias]
+    except Exception:
+        pass
+
+    # 2. Fall back to environment variable or .env
+    val = os.getenv(key)
+    if val is not None and str(val).strip() != "":
+        return val
+
+    return default
+
+
+def get_db_config(include_db=True):
+    """Retrieve MySQL database configuration from st.secrets first, then .env.
+
+    Converts DB_PORT to integer and configures optional SSL parameters.
+    """
+    raw_port = get_db_setting("DB_PORT", 3306)
+    try:
+        port = int(raw_port)
+    except (ValueError, TypeError):
+        port = 3306
+
+    host = str(get_db_setting("DB_HOST", "127.0.0.1")).strip()
+    user = str(get_db_setting("DB_USER", "root")).strip()
+    password = str(get_db_setting("DB_PASSWORD", ""))
+    db_name = str(get_db_setting("DB_NAME", "vehicle_mgmt")).strip()
+
+    config = {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "charset": "utf8mb4",
+    }
+    if include_db:
+        config["database"] = db_name
+
+    # Optional SSL support (e.g. for TiDB Cloud, Aiven, AWS RDS, PlanetScale)
+    ssl_ca = get_db_setting("DB_SSL_CA", get_db_setting("ssl_ca", ""))
+    if ssl_ca and os.path.exists(str(ssl_ca)):
+        config["ssl_ca"] = str(ssl_ca)
+
+    ssl_disabled = get_db_setting("DB_SSL_DISABLED", get_db_setting("ssl_disabled", None))
+    db_ssl = get_db_setting("DB_SSL", "")
+    if ssl_disabled is not None:
+        if isinstance(ssl_disabled, bool):
+            config["ssl_disabled"] = ssl_disabled
+        elif str(ssl_disabled).lower() in ("true", "1", "yes"):
+            config["ssl_disabled"] = True
+        elif str(ssl_disabled).lower() in ("false", "0", "no"):
+            config["ssl_disabled"] = False
+    elif str(db_ssl).lower() in ("true", "1", "yes", "require", "required"):
+        config["ssl_disabled"] = False
+
+    ssl_verify_cert = get_db_setting("DB_SSL_VERIFY_CERT", get_db_setting("ssl_verify_cert", None))
+    if ssl_verify_cert is not None:
+        if isinstance(ssl_verify_cert, bool):
+            config["ssl_verify_cert"] = ssl_verify_cert
+        elif str(ssl_verify_cert).lower() in ("false", "0", "no"):
+            config["ssl_verify_cert"] = False
+        elif str(ssl_verify_cert).lower() in ("true", "1", "yes"):
+            config["ssl_verify_cert"] = True
+
+    return config
+
+
+def get_connection(include_db=True):
+    """Establish and return a MySQL database connection.
+
+    Args:
+        include_db: If True, connects directly to DB_NAME; if False, connects to host server.
+
+    Returns:
+        mysql.connector.connection_cext.CMySQLConnection
+    """
+    config = get_db_config(include_db=include_db)
+    return mysql.connector.connect(**config)
+
+
+def test_db_connection():
+    """Test database connectivity with friendly error reporting.
+
+    Returns:
+        tuple (bool, str): Status and informational message.
+    """
+    config = get_db_config(include_db=True)
+    db_name = config.get("database", "vehicle_mgmt")
+    host = config.get("host", "127.0.0.1")
+    port = config.get("port", 3306)
+    user = config.get("user", "root")
+
+    try:
+        conn = get_connection(include_db=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return True, "Connected successfully to database."
+    except Error as e:
+        # Check if server is reachable but database needs to be initialized or created
+        try:
+            conn_server = get_connection(include_db=False)
+            conn_server.close()
+            return False, (
+                f"MySQL server at {host}:{port} is reachable, but database '{db_name}' could not be accessed. "
+                f"Error: {e}. Please click 'Initialize / Restore Database' or verify database permissions."
+            )
+        except Exception:
+            pass
+
+        return False, (
+            f"Cannot connect to MySQL server at {host}:{port} as user '{user}'. "
+            f"Error: {e}. "
+            "Please check that your MySQL server is running, and verify credentials in "
+            "Streamlit Cloud Secrets or local .env."
+        )
+
+
+def init_db(schema_path=None):
+    """Initialize database tables and default admin account if missing.
+
+    Safe for existing databases: creates tables if they do not exist and guarantees
+    that default admin (admin / admin123, bcrypt) is present without overwriting
+    existing user data or crashing if the database already exists.
+    """
+    if schema_path is None:
+        schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
+
+    db_name = str(get_db_setting("DB_NAME", "vehicle_mgmt")).strip()
+
+    conn = None
+    try:
+        # Step 1: Connect directly to the database first (cloud-friendly).
+        # Cloud providers usually pre-create the database and forbid CREATE DATABASE.
+        try:
+            conn = get_connection(include_db=True)
+        except Exception:
+            # If target database does not exist, attempt server-level connect and create it
+            try:
+                conn_server = get_connection(include_db=False)
+                cur_s = conn_server.cursor()
+                cur_s.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` DEFAULT CHARACTER SET utf8mb4")
+                conn_server.commit()
+                cur_s.close()
+                conn_server.close()
+                conn = get_connection(include_db=True)
+            except Exception as s_err:
+                return False, f"Could not connect to database '{db_name}': {s_err}"
+
+        cursor = conn.cursor()
+
+        # Step 2: Execute table creation DDL from schema.sql
+        if os.path.exists(schema_path):
+            with open(schema_path, "r", encoding="utf-8") as f:
+                sql_content = f.read()
+
+            statements = [stmt.strip() for stmt in sql_content.split(";") if stmt.strip()]
+            for stmt in statements:
+                # Strip CREATE DATABASE or USE statements if already connected to target database
+                upper_stmt = stmt.upper().replace("\n", " ").strip()
+                if upper_stmt.startswith("CREATE DATABASE") or upper_stmt.startswith("USE "):
+                    continue
+                try:
+                    cursor.execute(stmt)
+                except Error as err:
+                    # Ignore table already exists or duplicate entry errors
+                    if err.errno not in (errorcode.ER_TABLE_EXISTS_ERROR, errorcode.ER_DUP_ENTRY):
+                        raise err
+            conn.commit()
+
+        # Step 3: Ensure default admin exists (admin / admin123)
+        cursor.execute("SELECT user_id FROM users WHERE username = %s", ("admin",))
+        if not cursor.fetchone():
+            admin_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8")
+            cursor.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+                ("admin", admin_hash, "admin"),
+            )
+            conn.commit()
+
+        # Step 4: Ensure default staff exists (staff / staff123)
+        cursor.execute("SELECT user_id FROM users WHERE username = %s", ("staff",))
+        if not cursor.fetchone():
+            staff_hash = bcrypt.hashpw(b"staff123", bcrypt.gensalt()).decode("utf-8")
+            cursor.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+                ("staff", staff_hash, "staff"),
+            )
+            conn.commit()
+
+        cursor.close()
+        conn.close()
+        return True, "Database initialized successfully with required tables and default admin account."
+    except Exception as e:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return False, f"Database initialization failed: {e}"
+
+
+# Backwards-compatibility alias
+init_database = init_db
+
+
+def execute_query(query, params=None, fetch=None, dictionary=True):
+    """Execute a parameterized query safely with automatic commit or fetch.
+
+    Args:
+        query: SQL string with %s placeholders.
+        params: Tuple or list of parameters.
+        fetch: None (for DML), 'all' (for select all), or 'one' (for single record).
+        dictionary: Whether to return rows as dictionaries.
+
+    Returns:
+        list of dicts, single dict, or lastrowid / affected rows.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection(include_db=True)
+        cursor = conn.cursor(dictionary=dictionary)
+        cursor.execute(query, params or ())
+
+        if fetch == "all":
+            result = cursor.fetchall()
+            return result
+        elif fetch == "one":
+            result = cursor.fetchone()
+            return result
+        else:
+            conn.commit()
+            return cursor.lastrowid if cursor.lastrowid else cursor.rowcount
+    except Error as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+# ==============================================================================
+# AUTHENTICATION & USERS
+# ==============================================================================
+
+def authenticate_user(username, password):
+    """Verify user credentials with bcrypt.
+
+    Args:
+        username: Username string.
+        password: Plaintext password.
+
+    Returns:
+        dict: User data if authentication succeeds, else None.
+    """
+    query = "SELECT user_id, username, password_hash, role FROM users WHERE username = %s"
+    user = execute_query(query, (username.strip(),), fetch="one")
+    if not user:
+        return None
+
+    stored_hash = user["password_hash"]
+    if isinstance(stored_hash, str):
+        stored_hash = stored_hash.encode("utf-8")
+
+    if bcrypt.checkpw(password.encode("utf-8"), stored_hash):
+        return {
+            "user_id": user["user_id"],
+            "username": user["username"],
+            "role": user["role"],
+        }
+    return None
+
+
+def create_user(username, password, role="staff"):
+    """Create a new user with bcrypt-hashed password.
+
+    Args:
+        username: Unique username.
+        password: Plaintext password.
+        role: 'admin' or 'staff'.
+
+    Returns:
+        int: New user_id.
+    """
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    query = "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)"
+    return execute_query(query, (username.strip(), hashed, role))
+
+
+# ==============================================================================
+# VEHICLES MANAGEMENT
+# ==============================================================================
+
+def get_vehicles(search="", brand="All", engine_type="All", vehicle_type="All", status="All", min_price=0, max_price=None):
+    """Retrieve vehicles with dynamic filtering and search."""
+    conditions = []
+    params = []
+
+    if search:
+        search_pattern = f"%{search.strip()}%"
+        conditions.append("(vin LIKE %s OR brand LIKE %s OR model LIKE %s)")
+        params.extend([search_pattern, search_pattern, search_pattern])
+
+    if brand and brand != "All":
+        conditions.append("brand = %s")
+        params.append(brand)
+
+    if engine_type and engine_type != "All":
+        conditions.append("engine_type = %s")
+        params.append(engine_type)
+
+    if vehicle_type and vehicle_type != "All":
+        conditions.append("vehicle_type = %s")
+        params.append(vehicle_type)
+
+    if status and status != "All":
+        conditions.append("status = %s")
+        params.append(status)
+
+    if min_price > 0:
+        conditions.append("price >= %s")
+        params.append(min_price)
+
+    if max_price is not None and max_price > 0:
+        conditions.append("price <= %s")
+        params.append(max_price)
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+        SELECT vehicle_id, vin, brand, model, year_made, vehicle_type, 
+               engine_type, colour, price, quantity, status, created_at
+        FROM vehicles
+        {where_clause}
+        ORDER BY vehicle_id DESC
+    """
+    return execute_query(query, params, fetch="all")
+
+
+def get_vehicle_by_id(vehicle_id):
+    """Fetch single vehicle by ID."""
+    query = "SELECT * FROM vehicles WHERE vehicle_id = %s"
+    return execute_query(query, (vehicle_id,), fetch="one")
+
+
+def get_vehicle_by_vin(vin):
+    """Fetch single vehicle by VIN."""
+    query = "SELECT * FROM vehicles WHERE UPPER(vin) = UPPER(%s)"
+    return execute_query(query, (vin.strip(),), fetch="one")
+
+
+def add_vehicle(vin, brand, model, year_made, vehicle_type, engine_type, colour, price, quantity, status="Available"):
+    """Insert a new vehicle with duplicate VIN check.
+
+    Returns:
+        int: vehicle_id of inserted vehicle.
+    """
+    vin_clean = vin.strip().upper()
+    existing = get_vehicle_by_vin(vin_clean)
+    if existing:
+        raise ValueError(f"Vehicle with VIN '{vin_clean}' already exists in inventory.")
+
+    if price <= 0:
+        raise ValueError("Vehicle price must be greater than zero.")
+    if quantity < 0:
+        raise ValueError("Vehicle quantity cannot be negative.")
+
+    # Auto-adjust status if quantity is 0
+    if quantity == 0 and status == "Available":
+        status = "Sold Out"
+
+    query = """
+        INSERT INTO vehicles (vin, brand, model, year_made, vehicle_type, engine_type, colour, price, quantity, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    params = (
+        vin_clean,
+        brand.strip(),
+        model.strip(),
+        int(year_made),
+        vehicle_type,
+        engine_type,
+        colour.strip(),
+        float(price),
+        int(quantity),
+        status,
+    )
+    return execute_query(query, params)
+
+
+def update_vehicle(vehicle_id, brand, model, year_made, vehicle_type, engine_type, colour, price, quantity, status):
+    """Update existing vehicle record."""
+    if price <= 0:
+        raise ValueError("Price must be greater than zero.")
+    if quantity < 0:
+        raise ValueError("Quantity cannot be negative.")
+
+    if quantity == 0 and status == "Available":
+        status = "Sold Out"
+    elif quantity > 0 and status == "Sold Out":
+        status = "Available"
+
+    query = """
+        UPDATE vehicles
+        SET brand = %s, model = %s, year_made = %s, vehicle_type = %s,
+            engine_type = %s, colour = %s, price = %s, quantity = %s, status = %s
+        WHERE vehicle_id = %s
+    """
+    params = (
+        brand.strip(),
+        model.strip(),
+        int(year_made),
+        vehicle_type,
+        engine_type,
+        colour.strip(),
+        float(price),
+        int(quantity),
+        status,
+        int(vehicle_id),
+    )
+    return execute_query(query, params)
+
+
+def delete_vehicle(vehicle_id):
+    """Safely delete vehicle with check for related sales/services."""
+    # Check references
+    sales = execute_query("SELECT COUNT(*) AS cnt FROM sales WHERE vehicle_id = %s", (vehicle_id,), fetch="one")
+    if sales and sales["cnt"] > 0:
+        raise ValueError(f"Cannot delete vehicle: It has {sales['cnt']} related sales record(s).")
+
+    services = execute_query("SELECT COUNT(*) AS cnt FROM services WHERE vehicle_id = %s", (vehicle_id,), fetch="one")
+    if services and services["cnt"] > 0:
+        raise ValueError(f"Cannot delete vehicle: It has {services['cnt']} related service log(s).")
+
+    query = "DELETE FROM vehicles WHERE vehicle_id = %s"
+    return execute_query(query, (vehicle_id,))
+
+
+def get_distinct_brands():
+    """Retrieve list of distinct brands currently in inventory."""
+    rows = execute_query("SELECT DISTINCT brand FROM vehicles ORDER BY brand ASC", fetch="all")
+    return [r["brand"] for r in rows if r["brand"]]
+
+
+# ==============================================================================
+# CUSTOMER MANAGEMENT
+# ==============================================================================
+
+def validate_phone(phone):
+    """Validate 10-digit phone number."""
+    cleaned = re.sub(r"\D", "", phone.strip())
+    if len(cleaned) != 10:
+        return False, "Phone number must be exactly 10 digits."
+    return True, cleaned
+
+
+def get_customers(search=""):
+    """Retrieve all customers with optional search by name or phone."""
+    if search:
+        search_pattern = f"%{search.strip()}%"
+        query = """
+            SELECT customer_id, name, phone, email, address, created_at
+            FROM customers
+            WHERE name LIKE %s OR phone LIKE %s
+            ORDER BY customer_id DESC
+        """
+        return execute_query(query, (search_pattern, search_pattern), fetch="all")
+    else:
+        query = "SELECT * FROM customers ORDER BY customer_id DESC"
+        return execute_query(query, fetch="all")
+
+
+def get_customer_by_id(customer_id):
+    """Fetch customer by ID."""
+    query = "SELECT * FROM customers WHERE customer_id = %s"
+    return execute_query(query, (customer_id,), fetch="one")
+
+
+def get_customer_by_phone(phone):
+    """Fetch customer by phone."""
+    is_valid, cleaned_phone = validate_phone(phone)
+    if not is_valid:
+        return None
+    query = "SELECT * FROM customers WHERE phone = %s"
+    return execute_query(query, (cleaned_phone,), fetch="one")
+
+
+def add_customer(name, phone, email=None, address=None):
+    """Add a customer with 10-digit phone check and duplicate detection.
+
+    Returns:
+        int: customer_id of new customer.
+    """
+    if not name or not name.strip():
+        raise ValueError("Customer name is required.")
+
+    is_valid, cleaned_phone = validate_phone(phone)
+    if not is_valid:
+        raise ValueError(cleaned_phone)
+
+    # Check duplicate phone
+    existing = get_customer_by_phone(cleaned_phone)
+    if existing:
+        raise ValueError(f"A customer with phone number '{cleaned_phone}' already exists ({existing['name']}).")
+
+    email_val = email.strip() if email and email.strip() else None
+    address_val = address.strip() if address and address.strip() else None
+
+    query = """
+        INSERT INTO customers (name, phone, email, address)
+        VALUES (%s, %s, %s, %s)
+    """
+    return execute_query(query, (name.strip(), cleaned_phone, email_val, address_val))
+
+
+def update_customer(customer_id, name, phone, email=None, address=None):
+    """Update customer details with duplicate phone validation."""
+    if not name or not name.strip():
+        raise ValueError("Customer name is required.")
+
+    is_valid, cleaned_phone = validate_phone(phone)
+    if not is_valid:
+        raise ValueError(cleaned_phone)
+
+    # Check duplicate phone for other customer
+    existing = get_customer_by_phone(cleaned_phone)
+    if existing and existing["customer_id"] != int(customer_id):
+        raise ValueError(f"Phone number '{cleaned_phone}' is already registered to another customer.")
+
+    email_val = email.strip() if email and email.strip() else None
+    address_val = address.strip() if address and address.strip() else None
+
+    query = """
+        UPDATE customers
+        SET name = %s, phone = %s, email = %s, address = %s
+        WHERE customer_id = %s
+    """
+    return execute_query(query, (name.strip(), cleaned_phone, email_val, address_val, int(customer_id)))
+
+
+def delete_customer(customer_id):
+    """Safely delete customer with check for active sales/services."""
+    sales = execute_query("SELECT COUNT(*) AS cnt FROM sales WHERE customer_id = %s", (customer_id,), fetch="one")
+    if sales and sales["cnt"] > 0:
+        raise ValueError(f"Cannot delete customer: {sales['cnt']} sales transaction(s) associated with this customer.")
+
+    services = execute_query("SELECT COUNT(*) AS cnt FROM services WHERE customer_id = %s", (customer_id,), fetch="one")
+    if services and services["cnt"] > 0:
+        raise ValueError(f"Cannot delete customer: {services['cnt']} service record(s) associated with this customer.")
+
+    query = "DELETE FROM customers WHERE customer_id = %s"
+    return execute_query(query, (customer_id,))
+
+
+# ==============================================================================
+# SALES & TRANSACTIONS
+# ==============================================================================
+
+def execute_sale_transaction(customer_id, vehicle_id, sale_date, quantity, payment_mode):
+    """Record a vehicle sale and decrement inventory in a single atomic transaction.
+
+    Locks vehicle row with FOR UPDATE, verifies stock, inserts sale, updates stock,
+    and sets status to 'Sold Out' if quantity reaches zero. Rolls back on any error.
+
+    Returns:
+        dict: Result info with sale_id, total_price, and remaining stock.
+    """
+    if quantity <= 0:
+        raise ValueError("Sale quantity must be at least 1.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection(include_db=True)
+        conn.autocommit = False
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Lock and inspect vehicle stock
+        cursor.execute(
+            "SELECT vehicle_id, brand, model, price, quantity, status FROM vehicles WHERE vehicle_id = %s FOR UPDATE",
+            (vehicle_id,)
+        )
+        vehicle = cursor.fetchone()
+        if not vehicle:
+            raise ValueError("Vehicle not found.")
+
+        current_qty = vehicle["quantity"]
+        unit_price = float(vehicle["price"])
+
+        if current_qty < quantity:
+            raise ValueError(
+                f"Insufficient stock! Available: {current_qty}, Requested: {quantity} for {vehicle['brand']} {vehicle['model']}."
+            )
+
+        total_price = unit_price * quantity
+        new_qty = current_qty - quantity
+        new_status = "Sold Out" if new_qty == 0 else vehicle["status"]
+
+        # 2. Insert Sale Record
+        cursor.execute(
+            """
+            INSERT INTO sales (customer_id, vehicle_id, sale_date, quantity, total_price, payment_mode)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (customer_id, vehicle_id, sale_date, quantity, total_price, payment_mode)
+        )
+        sale_id = cursor.lastrowid
+
+        # 3. Decrement Inventory & Update Status
+        cursor.execute(
+            """
+            UPDATE vehicles
+            SET quantity = %s, status = %s
+            WHERE vehicle_id = %s
+            """,
+            (new_qty, new_status, vehicle_id)
+        )
+
+        # Commit atomic transaction
+        conn.commit()
+
+        return {
+            "sale_id": sale_id,
+            "total_price": total_price,
+            "remaining_qty": new_qty,
+            "vehicle_name": f"{vehicle['brand']} {vehicle['model']}",
+        }
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def get_sales(start_date=None, end_date=None, payment_mode="All", search=""):
+    """Fetch sales history with joined customer and vehicle details."""
+    conditions = []
+    params = []
+
+    if start_date:
+        conditions.append("s.sale_date >= %s")
+        params.append(start_date)
+
+    if end_date:
+        conditions.append("s.sale_date <= %s")
+        params.append(end_date)
+
+    if payment_mode and payment_mode != "All":
+        conditions.append("s.payment_mode = %s")
+        params.append(payment_mode)
+
+    if search:
+        pattern = f"%{search.strip()}%"
+        conditions.append("(c.name LIKE %s OR c.phone LIKE %s OR v.brand LIKE %s OR v.model LIKE %s OR v.vin LIKE %s)")
+        params.extend([pattern, pattern, pattern, pattern, pattern])
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+        SELECT s.sale_id, s.sale_date, s.quantity, s.total_price, s.payment_mode, s.created_at,
+               c.customer_id, c.name AS customer_name, c.phone AS customer_phone,
+               v.vehicle_id, v.brand, v.model, v.vin, v.colour, v.vehicle_type
+        FROM sales s
+        JOIN customers c ON s.customer_id = c.customer_id
+        JOIN vehicles v ON s.vehicle_id = v.vehicle_id
+        {where_clause}
+        ORDER BY s.sale_date DESC, s.sale_id DESC
+    """
+    return execute_query(query, params, fetch="all")
+
+
+# ==============================================================================
+# SERVICES MANAGEMENT
+# ==============================================================================
+
+def add_service(vehicle_id, customer_id, service_date, description, cost, status="Pending", mark_vehicle_service=False):
+    """Log a new vehicle service entry."""
+    if not description or not description.strip():
+        raise ValueError("Service description is required.")
+    if cost < 0:
+        raise ValueError("Service cost cannot be negative.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection(include_db=True)
+        conn.autocommit = False
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO services (vehicle_id, customer_id, service_date, description, cost, status)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (vehicle_id, customer_id, service_date, description.strip(), float(cost), status)
+        )
+        service_id = cursor.lastrowid
+
+        if mark_vehicle_service and status in ("Pending", "In Progress"):
+            cursor.execute("UPDATE vehicles SET status = 'Under Service' WHERE vehicle_id = %s", (vehicle_id,))
+
+        conn.commit()
+        return service_id
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def update_service_status(service_id, new_status, new_cost=None, release_vehicle=False):
+    """Update status and optional cost for a service record."""
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection(include_db=True)
+        conn.autocommit = False
+        cursor = conn.cursor(dictionary=True)
+
+        if new_cost is not None and new_cost >= 0:
+            cursor.execute(
+                "UPDATE services SET status = %s, cost = %s WHERE service_id = %s",
+                (new_status, float(new_cost), service_id)
+            )
+        else:
+            cursor.execute("UPDATE services SET status = %s WHERE service_id = %s", (new_status, service_id))
+
+        if release_vehicle and new_status == "Completed":
+            # If completed, check vehicle quantity to set Available or Sold Out
+            cursor.execute(
+                """
+                UPDATE vehicles v
+                JOIN services s ON v.vehicle_id = s.vehicle_id
+                SET v.status = CASE WHEN v.quantity > 0 THEN 'Available' ELSE 'Sold Out' END
+                WHERE s.service_id = %s
+                """,
+                (service_id,)
+            )
+
+        conn.commit()
+        return True
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def get_services(status="All", search=""):
+    """Retrieve service records with vehicle and customer details."""
+    conditions = []
+    params = []
+
+    if status and status != "All":
+        conditions.append("s.status = %s")
+        params.append(status)
+
+    if search:
+        pattern = f"%{search.strip()}%"
+        conditions.append("(c.name LIKE %s OR c.phone LIKE %s OR v.brand LIKE %s OR v.model LIKE %s OR v.vin LIKE %s OR s.description LIKE %s)")
+        params.extend([pattern, pattern, pattern, pattern, pattern, pattern])
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+        SELECT s.service_id, s.service_date, s.description, s.cost, s.status, s.created_at,
+               v.vehicle_id, v.brand, v.model, v.vin, v.colour,
+               c.customer_id, c.name AS customer_name, c.phone AS customer_phone
+        FROM services s
+        JOIN vehicles v ON s.vehicle_id = v.vehicle_id
+        JOIN customers c ON s.customer_id = c.customer_id
+        {where_clause}
+        ORDER BY CASE s.status WHEN 'Pending' THEN 1 WHEN 'In Progress' THEN 2 ELSE 3 END,
+                 s.service_date DESC, s.service_id DESC
+    """
+    return execute_query(query, params, fetch="all")
+
+
+def get_pending_services():
+    """Retrieve services in Pending or In Progress status."""
+    query = """
+        SELECT s.service_id, s.service_date, s.description, s.cost, s.status,
+               v.vehicle_id, v.brand, v.model, v.vin,
+               c.customer_id, c.name AS customer_name, c.phone AS customer_phone
+        FROM services s
+        JOIN vehicles v ON s.vehicle_id = v.vehicle_id
+        JOIN customers c ON s.customer_id = c.customer_id
+        WHERE s.status IN ('Pending', 'In Progress')
+        ORDER BY s.service_date ASC
+    """
+    return execute_query(query, fetch="all")
+
+
+# ==============================================================================
+# DASHBOARD & REPORTS ANALYTICS
+# ==============================================================================
+
+def get_dashboard_kpis():
+    """Calculate key performance indicators for the dashboard."""
+    # 1. Total Stock (sum of vehicle quantities)
+    stock_res = execute_query("SELECT COALESCE(SUM(quantity), 0) AS total_stock FROM vehicles", fetch="one")
+    total_stock = stock_res["total_stock"] if stock_res else 0
+
+    # 2. Total Customers
+    cust_res = execute_query("SELECT COUNT(*) AS total_customers FROM customers", fetch="one")
+    total_customers = cust_res["total_customers"] if cust_res else 0
+
+    # 3. Monthly Sales Count & Monthly Revenue
+    now = datetime.now()
+    month_sales_res = execute_query(
+        """
+        SELECT COUNT(*) AS month_sales_count,
+               COALESCE(SUM(total_price), 0.0) AS month_revenue
+        FROM sales
+        WHERE YEAR(sale_date) = %s AND MONTH(sale_date) = %s
+        """,
+        (now.year, now.month),
+        fetch="one"
+    )
+    month_sales_count = month_sales_res["month_sales_count"] if month_sales_res else 0
+    month_revenue = float(month_sales_res["month_revenue"]) if month_sales_res else 0.0
+
+    # 4. All-time Total Revenue
+    all_time_rev = execute_query("SELECT COALESCE(SUM(total_price), 0.0) AS total_revenue FROM sales", fetch="one")
+    total_revenue = float(all_time_rev["total_revenue"]) if all_time_rev else 0.0
+
+    # 5. Low-stock vehicles count (quantity < 3)
+    low_stock_res = execute_query(
+        """
+        SELECT COUNT(*) AS low_stock_count
+        FROM vehicles
+        WHERE quantity < 3 AND status != 'Sold Out'
+        """,
+        fetch="one"
+    )
+    low_stock_count = low_stock_res["low_stock_count"] if low_stock_res else 0
+
+    # 6. Pending Services
+    pend_serv = execute_query("SELECT COUNT(*) AS pending_count FROM services WHERE status = 'Pending'", fetch="one")
+    pending_services_count = pend_serv["pending_count"] if pend_serv else 0
+
+    return {
+        "total_stock": int(total_stock),
+        "total_customers": int(total_customers),
+        "month_sales_count": int(month_sales_count),
+        "month_revenue": month_revenue,
+        "total_revenue": total_revenue,
+        "low_stock_count": int(low_stock_count),
+        "pending_services_count": int(pending_services_count),
+    }
+
+
+def get_low_stock_vehicles():
+    """Retrieve all vehicles with quantity < 3."""
+    query = """
+        SELECT vehicle_id, vin, brand, model, vehicle_type, quantity, price, status
+        FROM vehicles
+        WHERE quantity < 3
+        ORDER BY quantity ASC, brand ASC
+    """
+    return execute_query(query, fetch="all")
+
+
+def get_sales_by_month_data():
+    """Get aggregated monthly sales revenue and count for charts."""
+    query = """
+        SELECT DATE_FORMAT(sale_date, '%Y-%m') AS sale_month,
+               COUNT(*) AS sales_count,
+               SUM(quantity) AS units_sold,
+               SUM(total_price) AS total_revenue
+        FROM sales
+        GROUP BY DATE_FORMAT(sale_date, '%Y-%m')
+        ORDER BY sale_month ASC
+    """
+    rows = execute_query(query, fetch="all")
+    if not rows:
+        return pd.DataFrame(columns=["sale_month", "sales_count", "units_sold", "total_revenue"])
+    df = pd.DataFrame(rows)
+    df["total_revenue"] = df["total_revenue"].astype(float)
+    df["units_sold"] = df["units_sold"].astype(int)
+    df["sales_count"] = df["sales_count"].astype(int)
+    return df
+
+
+def get_stock_by_brand_data():
+    """Get inventory distribution grouped by brand."""
+    query = """
+        SELECT brand,
+               SUM(quantity) AS total_stock,
+               COUNT(*) AS model_count
+        FROM vehicles
+        GROUP BY brand
+        ORDER BY total_stock DESC
+    """
+    rows = execute_query(query, fetch="all")
+    if not rows:
+        return pd.DataFrame(columns=["brand", "total_stock", "model_count"])
+    df = pd.DataFrame(rows)
+    df["total_stock"] = df["total_stock"].astype(int)
+    return df
+
+
+def get_stock_by_type_data():
+    """Get vehicle count grouped by vehicle_type."""
+    query = """
+        SELECT vehicle_type,
+               SUM(quantity) AS total_stock,
+               COUNT(*) AS count
+        FROM vehicles
+        GROUP BY vehicle_type
+        ORDER BY total_stock DESC
+    """
+    rows = execute_query(query, fetch="all")
+    if not rows:
+        return pd.DataFrame(columns=["vehicle_type", "total_stock", "count"])
+    df = pd.DataFrame(rows)
+    df["total_stock"] = df["total_stock"].astype(int)
+    return df
+
+
+def get_reports_summary(start_date, end_date):
+    """Aggregate detailed financial and sales figures for reports."""
+    query = """
+        SELECT COUNT(*) AS total_transactions,
+               COALESCE(SUM(quantity), 0) AS total_units_sold,
+               COALESCE(SUM(total_price), 0.0) AS total_revenue,
+               COALESCE(AVG(total_price), 0.0) AS avg_order_value
+        FROM sales
+        WHERE sale_date BETWEEN %s AND %s
+    """
+    sales_kpi = execute_query(query, (start_date, end_date), fetch="one")
+
+    serv_query = """
+        SELECT COUNT(*) AS services_count,
+               COALESCE(SUM(cost), 0.0) AS service_revenue
+        FROM services
+        WHERE service_date BETWEEN %s AND %s
+    """
+    serv_kpi = execute_query(serv_query, (start_date, end_date), fetch="one")
+
+    brand_query = """
+        SELECT v.brand,
+               COUNT(*) AS sales_count,
+               SUM(s.quantity) AS units_sold,
+               SUM(s.total_price) AS brand_revenue
+        FROM sales s
+        JOIN vehicles v ON s.vehicle_id = v.vehicle_id
+        WHERE s.sale_date BETWEEN %s AND %s
+        GROUP BY v.brand
+        ORDER BY brand_revenue DESC
+    """
+    brand_rows = execute_query(brand_query, (start_date, end_date), fetch="all")
+    brand_df = pd.DataFrame(brand_rows) if brand_rows else pd.DataFrame(columns=["brand", "sales_count", "units_sold", "brand_revenue"])
+    if not brand_df.empty:
+        brand_df["brand_revenue"] = brand_df["brand_revenue"].astype(float)
+        brand_df["units_sold"] = brand_df["units_sold"].astype(int)
+
+    return {
+        "total_transactions": int(sales_kpi["total_transactions"]) if sales_kpi else 0,
+        "total_units_sold": int(sales_kpi["total_units_sold"]) if sales_kpi else 0,
+        "total_revenue": float(sales_kpi["total_revenue"]) if sales_kpi else 0.0,
+        "avg_order_value": float(sales_kpi["avg_order_value"]) if sales_kpi else 0.0,
+        "services_count": int(serv_kpi["services_count"]) if serv_kpi else 0,
+        "service_revenue": float(serv_kpi["service_revenue"]) if serv_kpi else 0.0,
+        "brand_summary": brand_df,
+    }
+

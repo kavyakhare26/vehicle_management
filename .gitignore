@@ -1,0 +1,22 @@
+# Environment and Secrets (Never commit credentials to Git)
+.env
+.env.local
+.env.*
+.streamlit/secrets.toml
+
+# Python Bytecode and Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
