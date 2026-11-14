@@ -354,6 +354,13 @@ def test_db_connection():
 
         # 2. Error 2003 / 2005: Can't connect to server / Unknown Host
         if err_no in (2003, 2005) or "2003" in err_msg or "2005" in err_msg:
+            if "your-" in host.lower() or "example" in host.lower():
+                return False, (
+                    f"❌ **Placeholder Host Detected:** `{host}:{port}`.\n\n"
+                    "You still have the example placeholder text in your Streamlit Secrets. "
+                    "Please replace `your-aiven-host` with your **actual Aiven host** (e.g., `mysql-xxxx.a.aivencloud.com`) "
+                    "or copy the full **Service URI** from your Aiven Console overview."
+                )
             return False, (
                 f"❌ **Cannot reach MySQL server at `{host}:{port}` (Error: {err_msg}).**\n\n"
                 "**Troubleshooting steps:**\n"
