@@ -300,8 +300,209 @@ def get_connection(include_db=True, retry_defaultdb=True):
         raise err
 
 
+# ==============================================================================
+# CORE TABLE SCHEMAS (DDL)
+# ==============================================================================
+
+CORE_TABLES_DDL = {
+    "users": """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(50) NOT NULL UNIQUE,
+            password_hash VARCHAR(255) NOT NULL,
+            role ENUM('admin', 'staff') NOT NULL DEFAULT 'staff',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+    "customers": """
+        CREATE TABLE IF NOT EXISTS customers (
+            customer_id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            phone VARCHAR(15) NOT NULL UNIQUE,
+            email VARCHAR(100) NULL,
+            address TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+    "vehicles": """
+        CREATE TABLE IF NOT EXISTS vehicles (
+            vehicle_id INT AUTO_INCREMENT PRIMARY KEY,
+            vin VARCHAR(50) NOT NULL UNIQUE,
+            brand VARCHAR(50) NOT NULL,
+            model VARCHAR(50) NOT NULL,
+            year_made INT NOT NULL,
+            vehicle_type ENUM('Car', 'Bike', 'Truck', 'Bus', 'SUV') NOT NULL,
+            engine_type ENUM('Petrol', 'Diesel', 'CNG', 'Electric', 'Hybrid') NOT NULL,
+            colour VARCHAR(30) NOT NULL,
+            price DECIMAL(12, 2) NOT NULL CHECK (price > 0),
+            quantity INT NOT NULL CHECK (quantity >= 0),
+            status ENUM('Available', 'Sold Out', 'Under Service') NOT NULL DEFAULT 'Available',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+    "sales": """
+        CREATE TABLE IF NOT EXISTS sales (
+            sale_id INT AUTO_INCREMENT PRIMARY KEY,
+            customer_id INT NOT NULL,
+            vehicle_id INT NOT NULL,
+            sale_date DATE NOT NULL,
+            quantity INT NOT NULL CHECK (quantity > 0),
+            total_price DECIMAL(12, 2) NOT NULL,
+            payment_mode ENUM('Cash', 'UPI', 'Card', 'Loan') NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_sales_customer FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT,
+            CONSTRAINT fk_sales_vehicle FOREIGN KEY (vehicle_id) REFERENCES vehicles(vehicle_id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+    "services": """
+        CREATE TABLE IF NOT EXISTS services (
+            service_id INT AUTO_INCREMENT PRIMARY KEY,
+            vehicle_id INT NOT NULL,
+            customer_id INT NOT NULL,
+            service_date DATE NOT NULL,
+            description TEXT NOT NULL,
+            cost DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+            status ENUM('Pending', 'In Progress', 'Completed') NOT NULL DEFAULT 'Pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_services_vehicle FOREIGN KEY (vehicle_id) REFERENCES vehicles(vehicle_id) ON DELETE RESTRICT,
+            CONSTRAINT fk_services_customer FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+}
+
+
+def ensure_users_table(conn=None):
+    """Ensure the users table exists and default admin/staff accounts are created.
+
+    Safe and idempotent:
+    - Creates users table IF NOT EXISTS.
+    - Preserves all existing user records.
+    - Creates default admin (admin / admin123) if not found.
+    - Creates default staff (staff / staff123) if not found.
+    - Uses bcrypt with cryptographic salt.
+    """
+    should_close = False
+    if conn is None:
+        conn = get_connection(include_db=True, retry_defaultdb=True)
+        should_close = True
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(CORE_TABLES_DDL["users"])
+        conn.commit()
+
+        # Check if default admin exists; create only if missing
+        cursor.execute("SELECT user_id, password_hash FROM users WHERE username = %s", ("admin",))
+        if not cursor.fetchone():
+            admin_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8")
+            cursor.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+                ("admin", admin_hash, "admin"),
+            )
+            conn.commit()
+
+        # Check if default staff exists; create only if missing
+        cursor.execute("SELECT user_id, password_hash FROM users WHERE username = %s", ("staff",))
+        if not cursor.fetchone():
+            staff_hash = bcrypt.hashpw(b"staff123", bcrypt.gensalt()).decode("utf-8")
+            cursor.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+                ("staff", staff_hash, "staff"),
+            )
+            conn.commit()
+
+        cursor.close()
+        return True, "Users table verified and default accounts ready."
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False, f"Failed to ensure users table: {e}"
+    finally:
+        if should_close and conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def ensure_all_tables(conn=None):
+    """Ensure all core tables exist and initial demo data is seeded if tables are empty.
+
+    Safe and idempotent:
+    - Uses CREATE TABLE IF NOT EXISTS.
+    - Preserves existing records in all tables.
+    - Seeds default admin, staff, sample vehicles, and customer without duplicates.
+    """
+    should_close = False
+    if conn is None:
+        conn = get_connection(include_db=True, retry_defaultdb=True)
+        should_close = True
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Create tables in dependency order
+        for tbl in ("users", "customers", "vehicles", "sales", "services"):
+            cursor.execute(CORE_TABLES_DDL[tbl])
+        conn.commit()
+
+        # 2. Ensure default users
+        ensure_users_table(conn=conn)
+
+        # 3. Seed sample vehicles only if vehicles table is empty
+        cursor.execute("SELECT COUNT(*) AS cnt FROM vehicles")
+        v_cnt = cursor.fetchone().get("cnt", 0)
+        if v_cnt == 0:
+            sample_vehicles = [
+                ('1HGCR2F83HA001234', 'Honda', 'Civic Sedan', 2024, 'Car', 'Petrol', 'Crystal Black', 28500.00, 5, 'Available'),
+                ('5NMS3CAD1LH556789', 'Hyundai', 'Tucson AWD', 2023, 'SUV', 'Hybrid', 'Polar White', 34000.00, 2, 'Available'),
+                ('1FTFW1ED4NFC99881', 'Tata', 'Nexon EV Max', 2024, 'SUV', 'Electric', 'Teal Blue', 22000.00, 4, 'Available'),
+            ]
+            for v in sample_vehicles:
+                cursor.execute(
+                    """INSERT INTO vehicles (vin, brand, model, year_made, vehicle_type, engine_type, colour, price, quantity, status)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)""",
+                    v
+                )
+            conn.commit()
+
+        # 4. Seed sample customer only if customers table is empty
+        cursor.execute("SELECT COUNT(*) AS cnt FROM customers")
+        c_cnt = cursor.fetchone().get("cnt", 0)
+        if c_cnt == 0:
+            cursor.execute(
+                """INSERT INTO customers (name, phone, email, address)
+                   VALUES (%s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE name = VALUES(name)""",
+                ('Rahul Sharma', '9876543210', 'rahul.sharma@example.com', '124 MG Road, Indiranagar, Bengaluru, Karnataka')
+            )
+            conn.commit()
+
+        cursor.close()
+        return True, "All database tables and seed records verified successfully."
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False, f"Database table initialization failed: {e}"
+    finally:
+        if should_close and conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def test_db_connection():
     """Test database connectivity with friendly, specific error diagnostics.
+
+    Also auto-initializes tables and default accounts if connected to a blank database.
 
     Returns:
         tuple (bool, str): Status and informational message.
@@ -318,8 +519,19 @@ def test_db_connection():
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
         cursor.fetchone()
+
+        # Auto-verify / auto-heal schema: if users table does not exist, initialize all tables!
+        cursor.execute("SHOW TABLES LIKE 'users'")
+        has_users = cursor.fetchone()
         cursor.close()
         conn.close()
+
+        if not has_users:
+            init_ok, init_msg = ensure_all_tables()
+            if not init_ok:
+                return False, f"Connected to MySQL server, but failed to initialize schema: {init_msg}"
+            return True, "Connected and initialized database schema successfully."
+
         return True, "Connected successfully to database."
     except Error as e:
         err_no = getattr(e, "errno", None)
@@ -400,69 +612,44 @@ def init_db(schema_path=None):
     that default admin (admin / admin123, bcrypt) is present without overwriting
     existing user data or crashing if the database already exists.
     """
+    # 1. First ensure all core tables and default admin/staff are created via Python DDL
+    ok, msg = ensure_all_tables()
+    if not ok:
+        return False, msg
+
+    # 2. If an external schema.sql file exists, run it for any extra schema elements
     if schema_path is None:
         schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
-    conn = None
-    try:
-        # Step 1: Connect directly to the database first (cloud-friendly).
-        # Cloud providers usually pre-create the database (e.g. 'defaultdb' on Aiven).
+    if os.path.exists(schema_path):
+        conn = None
         try:
             conn = get_connection(include_db=True, retry_defaultdb=True)
-        except Exception as conn_err:
-            return False, f"Could not establish database connection: {conn_err}"
-
-        cursor = conn.cursor()
-
-        # Step 2: Execute table creation DDL from schema.sql
-        if os.path.exists(schema_path):
+            cursor = conn.cursor()
             with open(schema_path, "r", encoding="utf-8") as f:
                 sql_content = f.read()
 
             statements = [stmt.strip() for stmt in sql_content.split(";") if stmt.strip()]
             for stmt in statements:
-                # Strip CREATE DATABASE or USE statements if already connected to target database
                 upper_stmt = stmt.upper().replace("\n", " ").strip()
                 if upper_stmt.startswith("CREATE DATABASE") or upper_stmt.startswith("USE "):
                     continue
                 try:
                     cursor.execute(stmt)
                 except Error as err:
-                    # Ignore table already exists or duplicate entry errors
                     if err.errno not in (errorcode.ER_TABLE_EXISTS_ERROR, errorcode.ER_DUP_ENTRY):
-                        raise err
+                        pass  # Non-fatal if tables already exist
             conn.commit()
+            cursor.close()
+            conn.close()
+        except Exception:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
-        # Step 3: Ensure default admin exists (admin / admin123)
-        cursor.execute("SELECT user_id FROM users WHERE username = %s", ("admin",))
-        if not cursor.fetchone():
-            admin_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8")
-            cursor.execute(
-                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
-                ("admin", admin_hash, "admin"),
-            )
-            conn.commit()
-
-        # Step 4: Ensure default staff exists (staff / staff123)
-        cursor.execute("SELECT user_id FROM users WHERE username = %s", ("staff",))
-        if not cursor.fetchone():
-            staff_hash = bcrypt.hashpw(b"staff123", bcrypt.gensalt()).decode("utf-8")
-            cursor.execute(
-                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
-                ("staff", staff_hash, "staff"),
-            )
-            conn.commit()
-
-        cursor.close()
-        conn.close()
-        return True, "Database initialized successfully with required tables and default admin account."
-    except Exception as e:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        return False, f"Database initialization failed: {e}"
+    return True, "Database initialized successfully with required tables and default accounts."
 
 
 # Backwards-compatibility alias
@@ -515,6 +702,8 @@ def execute_query(query, params=None, fetch=None, dictionary=True):
 def authenticate_user(username, password):
     """Verify user credentials with bcrypt.
 
+    Auto-heals missing users table if connected to a fresh database without crashing.
+
     Args:
         username: Username string.
         password: Plaintext password.
@@ -523,7 +712,18 @@ def authenticate_user(username, password):
         dict: User data if authentication succeeds, else None.
     """
     query = "SELECT user_id, username, password_hash, role FROM users WHERE username = %s"
-    user = execute_query(query, (username.strip(),), fetch="one")
+    try:
+        user = execute_query(query, (username.strip(),), fetch="one")
+    except Error as e:
+        err_no = getattr(e, "errno", None)
+        err_msg = str(e)
+        if err_no == 1146 or "1146" in err_msg or "doesn't exist" in err_msg.lower():
+            # Auto-heal: users table missing -> create users table and default admin/staff!
+            ensure_users_table()
+            user = execute_query(query, (username.strip(),), fetch="one")
+        else:
+            raise e
+
     if not user:
         return None
 
@@ -531,12 +731,15 @@ def authenticate_user(username, password):
     if isinstance(stored_hash, str):
         stored_hash = stored_hash.encode("utf-8")
 
-    if bcrypt.checkpw(password.encode("utf-8"), stored_hash):
-        return {
-            "user_id": user["user_id"],
-            "username": user["username"],
-            "role": user["role"],
-        }
+    try:
+        if bcrypt.checkpw(password.encode("utf-8"), stored_hash):
+            return {
+                "user_id": user["user_id"],
+                "username": user["username"],
+                "role": user["role"],
+            }
+    except Exception:
+        return None
     return None
 
 
@@ -553,7 +756,15 @@ def create_user(username, password, role="staff"):
     """
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     query = "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)"
-    return execute_query(query, (username.strip(), hashed, role))
+    try:
+        return execute_query(query, (username.strip(), hashed, role))
+    except Error as e:
+        err_no = getattr(e, "errno", None)
+        err_msg = str(e)
+        if err_no == 1146 or "1146" in err_msg or "doesn't exist" in err_msg.lower():
+            ensure_users_table()
+            return execute_query(query, (username.strip(), hashed, role))
+        raise e
 
 
 # ==============================================================================

@@ -111,22 +111,25 @@ def render_login_view():
                     if not username.strip() or not password:
                         st.error("Please enter both username and password.")
                     else:
-                        user = db.authenticate_user(username, password)
-                        if user:
-                            st.session_state["logged_in"] = True
-                            st.session_state["user_id"] = user["user_id"]
-                            st.session_state["username"] = user["username"]
-                            st.session_state["role"] = user["role"]
-                            st.success(f"Welcome back, {user['username']} ({user['role'].title()})!")
-                            try:
-                                st.switch_page("pages/1_Dashboard.py")
-                            except Exception:
-                                st.rerun()
-                        else:
-                            st.error("Invalid username or password. Please verify and try again.")
+                        try:
+                            user = db.authenticate_user(username, password)
+                            if user:
+                                st.session_state["logged_in"] = True
+                                st.session_state["user_id"] = user["user_id"]
+                                st.session_state["username"] = user["username"]
+                                st.session_state["role"] = user["role"]
+                                st.success(f"Welcome back, {user['username']} ({user['role'].title()})!")
+                                try:
+                                    st.switch_page("pages/1_Dashboard.py")
+                                except Exception:
+                                    st.rerun()
+                            else:
+                                st.error("Invalid username or password. Please verify and try again.")
+                        except Exception as auth_err:
+                            st.error(f"⚠️ Sign in error: {auth_err}")
 
         # Default Demo Credentials Card
-        with st.expander("ℹ️ Default Demo Credentials", expanded=True):
+        with st.expander("ℹ️ Default Demo Credentials & Database Tools", expanded=True):
             st.markdown(
                 """
                 - **Administrator Account:**
@@ -139,6 +142,13 @@ def render_login_view():
                   - *Access for sales, services, and inventory tracking.*
                 """
             )
+            if st.button("🛠️ Verify / Seed Database Tables", use_container_width=True):
+                with st.spinner("Checking tables and default accounts..."):
+                    ok, msg = db.init_db()
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
 
 def render_authenticated_home():
