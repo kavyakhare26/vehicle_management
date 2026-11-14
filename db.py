@@ -6,6 +6,8 @@ schema initialization, and CRUD operations for users, vehicles, customers, sales
 
 import os
 import re
+import tempfile
+import urllib.parse
 from datetime import datetime
 from decimal import Decimal
 import bcrypt
@@ -17,87 +19,174 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Global CA certificate file reference to keep temporary file alive
+_CA_TEMP_FILE = None
+
+
+def _clean_secret_string(val):
+    """Clean whitespace and accidental enclosing quotes from configuration values."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if (len(s) >= 2) and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        s = s[1:-1].strip()
+    return s
+
+
+def _get_ca_file_path(ssl_ca_val):
+    """Resolve SSL CA certificate from either a file path or direct PEM string."""
+    global _CA_TEMP_FILE
+    if not ssl_ca_val:
+        return None
+    ssl_ca_str = str(ssl_ca_val).strip()
+    # 1. Existing file path
+    if os.path.isfile(ssl_ca_str):
+        return ssl_ca_str
+    # 2. Raw PEM certificate content (e.g. pasted into Streamlit Secrets)
+    if "-----BEGIN CERTIFICATE" in ssl_ca_str:
+        try:
+            if _CA_TEMP_FILE is None or not os.path.exists(_CA_TEMP_FILE.name):
+                _CA_TEMP_FILE = tempfile.NamedTemporaryFile(mode="w", suffix="_aiven_ca.pem", delete=False)
+                _CA_TEMP_FILE.write(ssl_ca_str)
+                _CA_TEMP_FILE.flush()
+            return _CA_TEMP_FILE.name
+        except Exception:
+            return None
+    return None
+
 
 def get_db_setting(key, default=""):
     """Retrieve setting from st.secrets first, then fall back to .env / os.environ.
     
-    Supports flat st.secrets keys (e.g. st.secrets["DB_HOST"]) as well as
-    nested sections (e.g. st.secrets["connections"]["mysql"] or st.secrets["mysql"]).
+    Supports:
+    1. Full Service URI / Connection String (e.g. Aiven Service URI)
+    2. Direct flat st.secrets keys (e.g. st.secrets["DB_HOST"])
+    3. Nested sections (e.g. st.secrets["connections"]["mysql"], st.secrets["mysql"], st.secrets["aiven"])
+    4. Common alias mappings (e.g. HOST, PORT, USER, USERNAME, PASSWORD, DATABASE)
     """
-    # 1. Try reading from Streamlit Secrets
+    key_upper = key.upper()
+
+    # 1. Check if a complete Service URI is provided in Streamlit Secrets or Environment
+    service_uri = None
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and st.secrets is not None:
+            for uri_key in ("SERVICE_URI", "DATABASE_URL", "MYSQL_URL", "DB_URI", "DB_URL", "AIVEN_URL"):
+                if uri_key in st.secrets and st.secrets[uri_key]:
+                    service_uri = _clean_secret_string(st.secrets[uri_key])
+                    break
+    except Exception:
+        pass
+
+    if not service_uri:
+        for uri_key in ("SERVICE_URI", "DATABASE_URL", "MYSQL_URL", "DB_URI", "DB_URL", "AIVEN_URL"):
+            env_uri = os.getenv(uri_key)
+            if env_uri and env_uri.strip():
+                service_uri = _clean_secret_string(env_uri)
+                break
+
+    if service_uri and "://" in service_uri:
+        try:
+            parsed = urllib.parse.urlparse(service_uri)
+            if key_upper == "DB_HOST":
+                return parsed.hostname or default
+            elif key_upper == "DB_PORT":
+                return parsed.port or default
+            elif key_upper in ("DB_USER", "DB_USERNAME"):
+                return parsed.username or default
+            elif key_upper == "DB_PASSWORD":
+                return urllib.parse.unquote(parsed.password or "")
+            elif key_upper in ("DB_NAME", "DB_DATABASE"):
+                db_from_uri = parsed.path.lstrip("/")
+                return db_from_uri if db_from_uri else default
+            elif key_upper == "DB_SSL":
+                qs = urllib.parse.parse_qs(parsed.query)
+                ssl_mode = qs.get("ssl-mode", qs.get("sslmode", [""]))[0].upper()
+                return "true" if ssl_mode in ("REQUIRED", "VERIFY-CA", "VERIFY-FULL", "TRUE") else default
+        except Exception:
+            pass
+
+    # 2. Check individual keys in Streamlit Secrets
     try:
         import streamlit as st
         if hasattr(st, "secrets") and st.secrets is not None:
             # Direct flat key
             if key in st.secrets:
-                return st.secrets[key]
-            
+                return _clean_secret_string(st.secrets[key])
+
             # Case-insensitive direct key
             for sec_k, sec_v in st.secrets.items():
                 if sec_k.lower() == key.lower():
-                    return sec_v
-            
-            # Nested: [connections.mysql]
-            if "connections" in st.secrets and "mysql" in st.secrets["connections"]:
-                mysql_sec = st.secrets["connections"]["mysql"]
-                if key in mysql_sec:
-                    return mysql_sec[key]
-                if key.lower() in mysql_sec:
-                    return mysql_sec[key.lower()]
-                alias_map = {
-                    "DB_HOST": "host",
-                    "DB_PORT": "port",
-                    "DB_USER": "username",
-                    "DB_PASSWORD": "password",
-                    "DB_NAME": "database",
-                }
-                alias = alias_map.get(key)
-                if alias and alias in mysql_sec:
-                    return mysql_sec[alias]
+                    return _clean_secret_string(sec_v)
 
-            # Nested: [mysql]
-            if "mysql" in st.secrets:
-                mysql_sec = st.secrets["mysql"]
-                if key in mysql_sec:
-                    return mysql_sec[key]
-                if key.lower() in mysql_sec:
-                    return mysql_sec[key.lower()]
-                alias_map = {
-                    "DB_HOST": "host",
-                    "DB_PORT": "port",
-                    "DB_USER": "username",
-                    "DB_PASSWORD": "password",
-                    "DB_NAME": "database",
-                }
-                alias = alias_map.get(key)
-                if alias and alias in mysql_sec:
-                    return mysql_sec[alias]
+            # Check nested sections: [connections.mysql], [mysql], [aiven]
+            alias_map = {
+                "DB_HOST": ["host", "hostname", "server"],
+                "DB_PORT": ["port"],
+                "DB_USER": ["user", "username"],
+                "DB_PASSWORD": ["password", "pass"],
+                "DB_NAME": ["database", "dbname", "db"],
+                "DB_SSL": ["ssl", "ssl_mode", "sslmode", "require_ssl"],
+                "DB_SSL_CA": ["ssl_ca", "ca_cert", "ca"],
+            }
+            candidate_keys = [key, key.lower()] + alias_map.get(key_upper, [])
+
+            for section_name in ("mysql", "aiven"):
+                if "connections" in st.secrets and section_name in st.secrets["connections"]:
+                    sub_sec = st.secrets["connections"][section_name]
+                    for ck in candidate_keys:
+                        if ck in sub_sec:
+                            return _clean_secret_string(sub_sec[ck])
+                if section_name in st.secrets:
+                    sub_sec = st.secrets[section_name]
+                    for ck in candidate_keys:
+                        if ck in sub_sec:
+                            return _clean_secret_string(sub_sec[ck])
     except Exception:
         pass
 
-    # 2. Fall back to environment variable or .env
+    # 3. Fall back to environment variable or .env
     val = os.getenv(key)
     if val is not None and str(val).strip() != "":
-        return val
+        return _clean_secret_string(val)
+
+    # Check common env aliases
+    env_aliases = {
+        "DB_HOST": ["MYSQL_HOST", "HOST"],
+        "DB_PORT": ["MYSQL_PORT", "PORT"],
+        "DB_USER": ["MYSQL_USER", "USER"],
+        "DB_PASSWORD": ["MYSQL_PASSWORD", "PASSWORD"],
+        "DB_NAME": ["MYSQL_DATABASE", "DATABASE"],
+        "DB_SSL": ["MYSQL_SSL", "SSL"],
+        "DB_SSL_CA": ["MYSQL_SSL_CA", "SSL_CA"],
+    }
+    for alias in env_aliases.get(key_upper, []):
+        alias_val = os.getenv(alias)
+        if alias_val is not None and str(alias_val).strip() != "":
+            return _clean_secret_string(alias_val)
 
     return default
 
 
-def get_db_config(include_db=True):
+def get_db_config(include_db=True, db_override=None):
     """Retrieve MySQL database configuration from st.secrets first, then .env.
 
-    Converts DB_PORT to integer and configures optional SSL parameters.
+    Converts DB_PORT to integer, sanitizes strings, and automatically configures
+    SSL/TLS required for cloud databases such as Aiven MySQL.
     """
     raw_port = get_db_setting("DB_PORT", 3306)
     try:
-        port = int(raw_port)
+        port = int(str(raw_port).strip())
     except (ValueError, TypeError):
         port = 3306
 
     host = str(get_db_setting("DB_HOST", "127.0.0.1")).strip()
     user = str(get_db_setting("DB_USER", "root")).strip()
     password = str(get_db_setting("DB_PASSWORD", ""))
-    db_name = str(get_db_setting("DB_NAME", "vehicle_mgmt")).strip()
+
+    # On Aiven MySQL, default database is 'defaultdb'
+    default_db = "defaultdb" if ("aivencloud" in host.lower() or user == "avnadmin") else "vehicle_mgmt"
+    db_name = str(db_override or get_db_setting("DB_NAME", default_db)).strip()
 
     config = {
         "host": host,
@@ -106,53 +195,113 @@ def get_db_config(include_db=True):
         "password": password,
         "charset": "utf8mb4",
     }
-    if include_db:
+    if include_db and db_name:
         config["database"] = db_name
 
-    # Optional SSL support (e.g. for TiDB Cloud, Aiven, AWS RDS, PlanetScale)
-    ssl_ca = get_db_setting("DB_SSL_CA", get_db_setting("ssl_ca", ""))
-    if ssl_ca and os.path.exists(str(ssl_ca)):
-        config["ssl_ca"] = str(ssl_ca)
-
-    ssl_disabled = get_db_setting("DB_SSL_DISABLED", get_db_setting("ssl_disabled", None))
+    # SSL / TLS Configuration
+    # Aiven MySQL requires SSL. Auto-enable SSL if connecting to Aiven or if requested.
+    is_aiven = "aivencloud.com" in host.lower() or "aiven.io" in host.lower() or user == "avnadmin"
     db_ssl = get_db_setting("DB_SSL", "")
-    if ssl_disabled is not None:
-        if isinstance(ssl_disabled, bool):
-            config["ssl_disabled"] = ssl_disabled
-        elif str(ssl_disabled).lower() in ("true", "1", "yes"):
+    ssl_requested = str(db_ssl).lower() in ("true", "1", "yes", "require", "required") or is_aiven
+
+    ssl_disabled_setting = get_db_setting("DB_SSL_DISABLED", get_db_setting("ssl_disabled", None))
+    if ssl_disabled_setting is not None:
+        if isinstance(ssl_disabled_setting, bool):
+            config["ssl_disabled"] = ssl_disabled_setting
+        elif str(ssl_disabled_setting).lower() in ("true", "1", "yes"):
             config["ssl_disabled"] = True
-        elif str(ssl_disabled).lower() in ("false", "0", "no"):
+        elif str(ssl_disabled_setting).lower() in ("false", "0", "no"):
             config["ssl_disabled"] = False
-    elif str(db_ssl).lower() in ("true", "1", "yes", "require", "required"):
+    elif ssl_requested:
         config["ssl_disabled"] = False
 
-    ssl_verify_cert = get_db_setting("DB_SSL_VERIFY_CERT", get_db_setting("ssl_verify_cert", None))
-    if ssl_verify_cert is not None:
-        if isinstance(ssl_verify_cert, bool):
-            config["ssl_verify_cert"] = ssl_verify_cert
-        elif str(ssl_verify_cert).lower() in ("false", "0", "no"):
+    # CA Certificate Handling
+    raw_ca = get_db_setting("DB_SSL_CA", get_db_setting("ssl_ca", ""))
+    ca_file_path = _get_ca_file_path(raw_ca)
+
+    if ca_file_path and os.path.exists(ca_file_path):
+        config["ssl_ca"] = ca_file_path
+        config["ssl_verify_cert"] = True
+    elif ssl_requested and not config.get("ssl_disabled", False):
+        # When connecting to Aiven without a local CA file, enable TLS encryption
+        # while disabling strict local CA verification so the connection succeeds out of the box
+        config["ssl_verify_cert"] = False
+        config["ssl_verify_identity"] = False
+
+    ssl_verify_cert_setting = get_db_setting("DB_SSL_VERIFY_CERT", get_db_setting("ssl_verify_cert", None))
+    if ssl_verify_cert_setting is not None:
+        if isinstance(ssl_verify_cert_setting, bool):
+            config["ssl_verify_cert"] = ssl_verify_cert_setting
+        elif str(ssl_verify_cert_setting).lower() in ("false", "0", "no"):
             config["ssl_verify_cert"] = False
-        elif str(ssl_verify_cert).lower() in ("true", "1", "yes"):
+        elif str(ssl_verify_cert_setting).lower() in ("true", "1", "yes"):
             config["ssl_verify_cert"] = True
 
     return config
 
 
-def get_connection(include_db=True):
+def get_connection(include_db=True, retry_defaultdb=True):
     """Establish and return a MySQL database connection.
+
+    Includes intelligent fallback for cloud databases like Aiven: if connecting to a custom
+    database fails because it has not been created yet, it connects to 'defaultdb' and creates
+    the database automatically.
 
     Args:
         include_db: If True, connects directly to DB_NAME; if False, connects to host server.
+        retry_defaultdb: Whether to retry with 'defaultdb' if the initial database is not found.
 
     Returns:
         mysql.connector.connection_cext.CMySQLConnection
     """
     config = get_db_config(include_db=include_db)
-    return mysql.connector.connect(**config)
+    target_db = config.get("database")
+
+    try:
+        return mysql.connector.connect(**config)
+    except Error as err:
+        # Check if the failure is because the database does not exist yet (Error 1049 or Error 1045)
+        # On Aiven MySQL, 'defaultdb' is the pre-created database.
+        if include_db and retry_defaultdb and target_db and target_db.lower() != "defaultdb":
+            try:
+                # Attempt connecting to 'defaultdb'
+                fallback_config = get_db_config(include_db=True, db_override="defaultdb")
+                conn_fallback = mysql.connector.connect(**fallback_config)
+                # Connected to defaultdb! Try to create target_db and switch to it
+                cursor = conn_fallback.cursor()
+                try:
+                    cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{target_db}` DEFAULT CHARACTER SET utf8mb4")
+                    cursor.execute(f"USE `{target_db}`")
+                    cursor.close()
+                    return conn_fallback
+                except Exception:
+                    cursor.close()
+                    # If target_db cannot be created, return connection on defaultdb
+                    return conn_fallback
+            except Exception:
+                pass
+
+        # If include_db=True fails and target_db is not created, try connecting without database
+        if include_db and retry_defaultdb and target_db:
+            try:
+                server_config = get_db_config(include_db=False)
+                conn_server = mysql.connector.connect(**server_config)
+                cursor = conn_server.cursor()
+                try:
+                    cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{target_db}` DEFAULT CHARACTER SET utf8mb4")
+                    cursor.execute(f"USE `{target_db}`")
+                    cursor.close()
+                    return conn_server
+                except Exception:
+                    cursor.close()
+            except Exception:
+                pass
+
+        raise err
 
 
 def test_db_connection():
-    """Test database connectivity with friendly error reporting.
+    """Test database connectivity with friendly, specific error diagnostics.
 
     Returns:
         tuple (bool, str): Status and informational message.
@@ -162,6 +311,7 @@ def test_db_connection():
     host = config.get("host", "127.0.0.1")
     port = config.get("port", 3306)
     user = config.get("user", "root")
+    is_aiven = "aivencloud" in host.lower() or user == "avnadmin"
 
     try:
         conn = get_connection(include_db=True)
@@ -172,22 +322,67 @@ def test_db_connection():
         conn.close()
         return True, "Connected successfully to database."
     except Error as e:
-        # Check if server is reachable but database needs to be initialized or created
-        try:
-            conn_server = get_connection(include_db=False)
-            conn_server.close()
-            return False, (
-                f"MySQL server at {host}:{port} is reachable, but database '{db_name}' could not be accessed. "
-                f"Error: {e}. Please click 'Initialize / Restore Database' or verify database permissions."
-            )
-        except Exception:
-            pass
+        err_no = getattr(e, "errno", None)
+        err_msg = str(e)
 
+        # 1. Error 1045: Access Denied (Authentication Failure)
+        if err_no == 1045 or "1045" in err_msg:
+            if is_aiven or user == "avnadmin":
+                return False, (
+                    f"❌ **Aiven MySQL Authentication Failed (Error 1045: Access Denied for user '{user}').**\n\n"
+                    f"**Connection Target:** Host `{host}` on Port `{port}` (Database: `{db_name}`).\n\n"
+                    "**How to fix this in Aiven & Streamlit Cloud:**\n"
+                    "1. **Password Mismatch (Most Common):** Log in to your [Aiven Console](https://console.aiven.io/) ➔ select your MySQL service ➔ **Overview** tab. Click the copy icon next to **Password**.\n"
+                    "2. **Streamlit Secrets Formatting:** In Streamlit Cloud (App Settings ➔ Secrets), ensure the password is wrapped in **single quotes** so characters like `#` are not treated as comments:\n"
+                    "   ```toml\n"
+                    "   DB_PASSWORD = 'your_exact_aiven_password'\n"
+                    "   ```\n"
+                    "3. **Reset Password:** If unsure of your current password, click **Reset password** in your Aiven MySQL console, copy the new password, and update it in Streamlit Secrets.\n"
+                    "4. **Port Check:** Aiven does NOT use port 3306! Ensure `DB_PORT` matches your Aiven service port (e.g. `21435`).\n"
+                    "5. **Database Name:** Aiven's default database is `defaultdb`. Ensure `DB_NAME = 'defaultdb'` (or the database you created in Aiven).\n"
+                    "6. **Service URI Alternative:** Alternatively, copy the full **Service URI** from Aiven and paste it into Secrets as:\n"
+                    "   ```toml\n"
+                    "   SERVICE_URI = 'mysql://avnadmin:password@host:port/defaultdb?ssl-mode=REQUIRED'\n"
+                    "   ```"
+                )
+            else:
+                return False, (
+                    f"❌ **MySQL Authentication Failed (Error 1045: Access Denied for user '{user}').**\n\n"
+                    f"Target server `{host}:{port}` rejected the credentials for user `{user}`. "
+                    "Please verify your `DB_USER` and `DB_PASSWORD` in Streamlit Secrets or `.env`."
+                )
+
+        # 2. Error 2003 / 2005: Can't connect to server / Unknown Host
+        if err_no in (2003, 2005) or "2003" in err_msg or "2005" in err_msg:
+            return False, (
+                f"❌ **Cannot reach MySQL server at `{host}:{port}` (Error: {err_msg}).**\n\n"
+                "**Troubleshooting steps:**\n"
+                "1. Verify that your Aiven MySQL service status is **Running** (not rebuilding or powered off).\n"
+                "2. Verify the hostname and port match your Aiven service overview.\n"
+                "3. Ensure public access is enabled on your Aiven service (enabled by default)."
+            )
+
+        # 3. SSL / TLS Handshake Errors (2026, 2055)
+        if "ssl" in err_msg.lower() or err_no in (2026, 2055):
+            return False, (
+                f"❌ **SSL/TLS Handshake Error connecting to `{host}:{port}`:** {err_msg}.\n\n"
+                "Aiven MySQL requires an encrypted SSL connection. AutoCore has enabled SSL negotiation. "
+                "If your cloud environment requires the CA certificate, download `ca.pem` from the Aiven console "
+                "and paste its text into Streamlit Secrets as `DB_SSL_CA = '''-----BEGIN CERTIFICATE...'''`."
+            )
+
+        # 4. Error 1049: Unknown Database
+        if err_no == 1049 or "1049" in err_msg:
+            return False, (
+                f"⚠️ **Database '{db_name}' not found on server `{host}:{port}`.**\n\n"
+                "On Aiven, the default database is `defaultdb`. Click 'Initialize / Restore Database' below "
+                "or set `DB_NAME = 'defaultdb'` in Streamlit Secrets."
+            )
+
+        # General error fallback
         return False, (
-            f"Cannot connect to MySQL server at {host}:{port} as user '{user}'. "
-            f"Error: {e}. "
-            "Please check that your MySQL server is running, and verify credentials in "
-            "Streamlit Cloud Secrets or local .env."
+            f"Cannot connect to MySQL server at {host}:{port} as user '{user}'. Error: {err_msg}. "
+            "Please verify your credentials in Streamlit Cloud Secrets or local .env."
         )
 
 
@@ -201,26 +396,14 @@ def init_db(schema_path=None):
     if schema_path is None:
         schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
-    db_name = str(get_db_setting("DB_NAME", "vehicle_mgmt")).strip()
-
     conn = None
     try:
         # Step 1: Connect directly to the database first (cloud-friendly).
-        # Cloud providers usually pre-create the database and forbid CREATE DATABASE.
+        # Cloud providers usually pre-create the database (e.g. 'defaultdb' on Aiven).
         try:
-            conn = get_connection(include_db=True)
-        except Exception:
-            # If target database does not exist, attempt server-level connect and create it
-            try:
-                conn_server = get_connection(include_db=False)
-                cur_s = conn_server.cursor()
-                cur_s.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` DEFAULT CHARACTER SET utf8mb4")
-                conn_server.commit()
-                cur_s.close()
-                conn_server.close()
-                conn = get_connection(include_db=True)
-            except Exception as s_err:
-                return False, f"Could not connect to database '{db_name}': {s_err}"
+            conn = get_connection(include_db=True, retry_defaultdb=True)
+        except Exception as conn_err:
+            return False, f"Could not establish database connection: {conn_err}"
 
         cursor = conn.cursor()
 

@@ -212,21 +212,36 @@ Sign in with:
 
 To deploy this application on **Streamlit Community Cloud**:
 
-1. Push your repository to GitHub (ensure `.env` is ignored by `.gitignore`).
+1. Push your repository to GitHub (ensure `.env` and `.streamlit/secrets.toml` are in `.gitignore`).
 2. Log in to [share.streamlit.io](https://share.streamlit.io/) and click **New app**.
-3. Select your repository, branch, and set Main file path to **`app.py`**.
-4. In **App settings ➔ Secrets**, enter your cloud MySQL database credentials:
-   ```toml
-   DB_HOST = "your-remote-mysql-host.example.com"
-   DB_PORT = 3306
-   DB_USER = "your_mysql_user"
-   DB_PASSWORD = "your_mysql_password"
-   DB_NAME = "vehicle_mgmt"
+3. Select your repository, branch (`main`), and set Main file path to **`app.py`**.
+4. In **App settings ➔ Secrets**, enter your cloud MySQL database credentials.
 
-   # Optional: If your cloud database provider requires SSL (e.g. TiDB, PlanetScale, Aiven, AWS RDS)
-   # DB_SSL = true
-   # DB_SSL_VERIFY_CERT = false
-   ```
+### Connecting with Aiven MySQL (Recommended)
+
+**Option A — Quickest (Using Aiven Service URI):**
+In Aiven Console ➔ Your MySQL Service ➔ **Overview**, copy the **Service URI** and paste into Streamlit Secrets:
+```toml
+SERVICE_URI = "mysql://avnadmin:YOUR_PASSWORD@your-service-name.a.aivencloud.com:PORT/defaultdb?ssl-mode=REQUIRED"
+```
+
+**Option B — Using Individual Parameters:**
+```toml
+DB_HOST = "your-service-name.a.aivencloud.com"
+DB_PORT = 12345                     # Aiven custom port (e.g. 10000-29999, NOT 3306)
+DB_USER = "avnadmin"
+DB_PASSWORD = 'YOUR_PASSWORD'       # MUST use single quotes so special chars (#, $, @) are not parsed as comments!
+DB_NAME = "defaultdb"               # Use Aiven's default database name
+DB_SSL = true
+DB_SSL_VERIFY_CERT = false
+```
+
+> **Important Aiven Tips:**
+> - If you receive `1045: Access denied for user 'avnadmin'`, reset your password in the Aiven console and copy the fresh password.
+> - Always wrap passwords in **single quotes** (`'your_password'`) in Streamlit Secrets if the password has `#`, `@`, or `$`, because TOML treats `#` as a comment line and truncates your password.
+> - Ensure the port is the custom high port shown in your Aiven dashboard (NOT `3306`).
+> - The default pre-created database in Aiven is `defaultdb`.
+
 5. Click **Save** and deploy! On first load, if the tables are not yet created, click the **"Initialize / Restore Database"** button on the home screen to automatically run the schema and seed the initial `admin` account.
 
 ---

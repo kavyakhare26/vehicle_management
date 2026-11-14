@@ -44,11 +44,23 @@ def render_login_view():
 
             cfg = db.get_db_config(include_db=True)
             with st.expander("🔍 Connection Diagnostics & Secrets Setup", expanded=True):
+                is_aiven = "aivencloud.com" in str(cfg.get('host', '')) or cfg.get('user') == "avnadmin"
                 st.write(f"- **Target Host:** `{cfg.get('host')}`")
                 st.write(f"- **Target Port:** `{cfg.get('port')}`")
                 st.write(f"- **User:** `{cfg.get('user')}`")
                 st.write(f"- **Database Name:** `{cfg.get('database')}`")
-                st.write(f"- **Password Configured:** `{'Yes (***)' if cfg.get('password') else 'No (Empty)'}`")
+                st.write(f"- **Password Set:** `{'Yes (' + str(len(cfg.get('password', ''))) + ' chars)' if cfg.get('password') else 'No (Empty)'}`")
+                st.write(f"- **SSL Active:** `{'Yes' if not cfg.get('ssl_disabled', False) else 'No'}`")
+
+                if is_aiven or "1045" in conn_msg:
+                    st.warning(
+                        "💡 **Aiven MySQL Troubleshooting Guide:**\n"
+                        "1. **Password**: Go to Aiven Console ➔ Your MySQL Service ➔ Overview ➔ Click 'Reset Password' or copy the password.\n"
+                        "2. **Single Quotes in Secrets**: If your password contains `#`, `$`, `@`, or `\\`, wrap it in single quotes in Streamlit Secrets: `DB_PASSWORD = '...'` so TOML does not truncate at `#`.\n"
+                        "3. **Port**: Aiven uses a high custom port (e.g., `10000`-`29999`), NOT `3306`.\n"
+                        "4. **Database**: Use `DB_NAME = 'defaultdb'` (Aiven's pre-created database).\n"
+                        "5. **One-Line Service URI**: Alternatively, copy the **Service URI** directly from Aiven and set `SERVICE_URI = '...'` in Streamlit Secrets."
+                    )
 
                 st.markdown(
                     """
@@ -57,11 +69,16 @@ def render_login_view():
                     2. Go to **Settings** ➔ **Secrets**.
                     3. Paste your cloud MySQL credentials (see `.streamlit/secrets.toml.example`):
                     ```toml
-                    DB_HOST = "your-remote-host.example.com"
-                    DB_PORT = 3306
-                    DB_USER = "your_user"
-                    DB_PASSWORD = "your_password"
-                    DB_NAME = "vehicle_mgmt"
+                    # Easiest with Aiven:
+                    SERVICE_URI = "mysql://avnadmin:YOUR_PASSWORD@your-host.a.aivencloud.com:PORT/defaultdb?ssl-mode=REQUIRED"
+
+                    # Or with individual parameters:
+                    DB_HOST = "your-host.a.aivencloud.com"
+                    DB_PORT = 12345
+                    DB_USER = "avnadmin"
+                    DB_PASSWORD = 'your_password_in_single_quotes'
+                    DB_NAME = "defaultdb"
+                    DB_SSL = true
                     ```
                     """
                 )
